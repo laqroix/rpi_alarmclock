@@ -2,8 +2,10 @@
 import os
 import csv
 import random
+import re
 from datetime import datetime
 from time import sleep
+import subprocess
 import threading
 
 import RPi.GPIO as GPIO
@@ -118,6 +120,150 @@ class Radio:
             self.player.play()
         else:
             self.player.stop()
+
+
+class VolumeControl:
+    """Provide a simple screen to trigger volume adjustments."""
+
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.cursor_v_index = 0
+        self.cursor_h_index = 1
+        self.feedback_counter = 0
+        self.last_message = ""
+        self.target_volume = self._read_current_volume() or 100
+
+    def set_v_cursor(self, cursor_offset):
+        self.cursor_v_index += cursor_offset
+        self.cursor_v_index %= 2
+
+    def set_h_cursor(self, cursor_offset):
+        if self.cursor_v_index == 1:
+            self._adjust_volume(cursor_offset)
+
+    def cdraw(self, image):
+        self.draw_top_menu(image)
+
+    def _adjust_volume(self, cursor_offset):
+        if cursor_offset == 0:
+            return
+
+        delta = 5 * (1 if cursor_offset > 0 else -1)
+        new_volume = max(0, min(100, self.target_volume + delta))
+        if new_volume == self.target_volume:
+            self.last_message = "volume limit reached"
+            self.feedback_counter = 30
+            return
+
+        self.target_volume = new_volume
+        self.cursor_h_index = 1 if delta > 0 else 0
+        self._set_volume(self.target_volume)
+
+    def _set_volume(self, volume):
+        try:
+            subprocess.run([
+                "amixer",
+                "sset",
+                "Master",
+                f"{volume}%",
+            ], check=True)
+            self.last_message = f"volume set to {volume}%"
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            self.last_message = "volume command failed"
+        self.feedback_counter = 50
+
+    def _read_current_volume(self):
+        try:
+            result = subprocess.run(
+                ["amixer", "sget", "Master"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            match = re.search(r"\[(\d{1,3})%\]", result.stdout)
+            if match:
+                value = int(match.group(1))
+                return max(0, min(100, value))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+        return None
+
+    def draw_top_menu(self, image):
+        self.draw = ImageDraw.Draw(image)
+        border = 2
+
+        rect_title_start = (0, 0)
+        rect_title_end = (self.width, self.height * 0.25)
+        rect_action_start = (0, self.height * 0.25)
+        rect_action_end = (self.width, self.height)
+
+        action_padding = 20
+        button_bottom = self.height - action_padding - 30
+        button_minus = [
+            (10, self.height * 0.25 + action_padding),
+            (self.width * 0.5 - 5, button_bottom),
+        ]
+        button_plus = [
+            (self.width * 0.5 + 5, self.height * 0.25 + action_padding),
+            (self.width - 10, button_bottom),
+        ]
+        message_area_start = (10, button_bottom + 5)
+        message_area_end = (self.width - 10, self.height - 10)
+
+        self.draw.rectangle(
+            [rect_title_start, rect_title_end],
+            fill='green' if self.cursor_v_index == 0 else None,
+            outline='white',
+            width=border,
+        )
+        self.draw.rectangle(
+            [rect_action_start, rect_action_end],
+            fill='green' if self.cursor_v_index == 1 else None,
+            outline='white',
+            width=border,
+        )
+        self.draw.rectangle(
+            [button_minus[0], button_minus[1]],
+            fill='green' if self.cursor_v_index == 1 and self.cursor_h_index == 0 else 'grey',
+            outline='white',
+            width=border,
+        )
+        self.draw.rectangle(
+            [button_plus[0], button_plus[1]],
+            fill='green' if self.cursor_v_index == 1 and self.cursor_h_index == 1 else 'grey',
+            outline='white',
+            width=border,
+        )
+
+        font_size = int(self.height * 0.15)
+        font_small_size = int(self.height * 0.09)
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+            font_small = ImageFont.truetype("arial.ttf", font_small_size)
+        except IOError:
+            font = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+
+        rect_start = (0, 0)
+        rect_mid_end = (self.width, self.height * 0.25)
+        draw_in_box(f"volume {self.target_volume}%", font, rect_start, rect_mid_end, self.draw)
+        draw_in_box("-5", font, button_minus[0], button_minus[1], self.draw)
+        draw_in_box("+5", font, button_plus[0], button_plus[1], self.draw)
+
+        if self.feedback_counter > 0 and self.last_message:
+            self.feedback_counter -= 1
+            draw_in_box(
+                self.last_message,
+                font_small,
+                message_area_start,
+                message_area_end,
+                self.draw,
+            )
+            if self.feedback_counter == 0:
+                self.last_message = ""
+
 
 
 class Alarm:
@@ -480,7 +626,8 @@ class Menu:
         self.top_menu = [
             Alarm(self.WIDTH, self.HEIGHT),
             AlarmEdit(self.WIDTH, self.HEIGHT),
-            Radio(self.WIDTH, self.HEIGHT)
+            Radio(self.WIDTH, self.HEIGHT),
+            VolumeControl(self.WIDTH, self.HEIGHT),
         ]
 
     def check_alarm(self):
